@@ -1,6 +1,6 @@
-# robo_trainer
+# RoboCon-萝卜控
 
-A new Flutter project.
+An app for embodied intelligence data collection through crowdsourcing. 
 
 ## Getting Started
 
