@@ -1,11 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
+import 'package:native_device_orientation/native_device_orientation.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:robo_trainer/config.dart';
-import 'package:robo_trainer/teleop_jpeg.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -48,31 +49,102 @@ class TeleopHomePage extends StatefulWidget {
   State<TeleopHomePage> createState() => _TeleopHomePageState();
 }
 
-class _TeleopHomePageState extends State<TeleopHomePage> {
-  final _urlController = TextEditingController(text: kDefaultTeleopWsUrl);
-  WebSocketChannel? _channel;
-  CameraController? _camera;
+class _TeleopHomePageState extends State<TeleopHomePage>
+    with SingleTickerProviderStateMixin {
+  final _urlController = TextEditingController(text: kDefaultTeleopOfferUrl);
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  bool _rendererReady = false;
+  RTCPeerConnection? _peer;
+  MediaStream? _localStream;
   bool _streaming = false;
-  int _streamTick = 0;
-  int _framesSent = 0;
+  bool _isConnecting = false;
+  bool _teleopConnected = false;
+  String _stateLabel = 'IDLE';
   String? _lastError;
+  NativeDeviceOrientation _deviceOrientation = NativeDeviceOrientation.unknown;
+  StreamSubscription<NativeDeviceOrientation>? _orientationSub;
+  late final AnimationController _rotateHintController;
+
+  String _friendlyConnectionLabel(dynamic state) {
+    final raw = state.toString().toLowerCase();
+    if (raw.contains('disconnected')) return 'DISCONNECTED';
+    if (raw.contains('failed')) return 'FAILED';
+    if (raw.contains('closed')) return 'CLOSED';
+    if (raw.contains('connecting')) return 'CONNECTING';
+    if (raw.contains('connected')) return 'LIVE';
+    if (raw.contains('new')) return 'NEW';
+    return 'CONNECTING';
+  }
+
+  bool get _isTargetOrientation =>
+      _deviceOrientation == NativeDeviceOrientation.landscapeLeft;
+
+  bool get _showRotateGuide => _teleopConnected && !_isTargetOrientation;
+
+  Future<void> _waitIceGatheringComplete(
+    RTCPeerConnection pc, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final sw = Stopwatch()..start();
+    while (sw.elapsed < timeout) {
+      final current = await pc.getIceGatheringState();
+      if (current == RTCIceGatheringState.RTCIceGatheringStateComplete) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_initRenderer());
+    _rotateHintController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
+    _orientationSub = NativeDeviceOrientationCommunicator()
+        .onOrientationChanged(useSensor: true)
+        .listen((orientation) {
+      if (!mounted) return;
+      setState(() {
+        _deviceOrientation = orientation;
+      });
+    });
+  }
+
+  Future<void> _initRenderer() async {
+    await _localRenderer.initialize();
+    if (!mounted) return;
+    setState(() {
+      _rendererReady = true;
+    });
+  }
 
   @override
   void dispose() {
     _urlController.dispose();
+    _orientationSub?.cancel();
+    _rotateHintController.dispose();
     unawaited(_teardown(silent: true));
+    if (_rendererReady) {
+      unawaited(_localRenderer.dispose());
+    }
     super.dispose();
   }
 
   Future<void> _teardown({bool silent = false}) async {
-    final c = _camera;
-    _camera = null;
+    final peer = _peer;
+    final local = _localStream;
+    _peer = null;
+    _localStream = null;
+
     try {
-      if (c != null) {
-        if (c.value.isStreamingImages) {
-          await c.stopImageStream();
+      if (local != null) {
+        for (final track in local.getTracks()) {
+          await track.stop();
         }
-        await c.dispose();
+        await local.dispose();
       }
     } catch (e) {
       if (!silent) {
@@ -81,15 +153,24 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
         }
       }
     }
+
     try {
-      await _channel?.sink.close();
+      if (peer != null) {
+        await peer.close();
+      }
     } catch (_) {
       // ignore
     }
-    _channel = null;
+    if (_rendererReady) {
+      _localRenderer.srcObject = null;
+    }
+
     if (mounted) {
       setState(() {
         _streaming = false;
+        _isConnecting = false;
+        _teleopConnected = false;
+        _stateLabel = 'IDLE';
       });
     }
   }
@@ -99,9 +180,11 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
   }
 
   Future<void> _onTeleop() async {
-    if (_streaming) return;
+    if (_streaming || _isConnecting) return;
     setState(() {
       _lastError = null;
+      _isConnecting = true;
+      _stateLabel = 'CONNECTING';
     });
 
     final status = await Permission.camera.request();
@@ -109,106 +192,104 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
       if (!mounted) return;
       setState(() {
         _lastError = '需要摄像头权限才能推流';
+        _isConnecting = false;
+        _stateLabel = 'IDLE';
       });
       return;
     }
 
-    final url = _urlController.text.trim();
-    if (url.isEmpty) {
-      setState(() => _lastError = '请填写 WebSocket 地址');
+    final offerUrl = _urlController.text.trim();
+    if (offerUrl.isEmpty) {
+      setState(() {
+        _lastError = '请填写信令地址';
+        _isConnecting = false;
+        _stateLabel = 'IDLE';
+      });
       return;
     }
 
-    final cameras = await availableCameras();
-    CameraDescription? front;
-    for (final c in cameras) {
-      if (c.lensDirection == CameraLensDirection.front) {
-        front = c;
-        break;
-      }
-    }
-    if (front == null) {
-      if (mounted) {
-        setState(
-          () => _lastError = '未找到前置摄像头',
-        );
-      }
-      return;
-    }
-
-    WebSocketChannel? ch;
     try {
-      ch = WebSocketChannel.connect(Uri.parse(url));
-      // 等待一帧，尽早暴露连接错误
-      await ch.ready;
+      final localStream = await navigator.mediaDevices.getUserMedia({
+        'audio': false,
+        'video': {
+          'facingMode': 'user',
+          'width': {'ideal': 640},
+          'height': {'ideal': 480},
+          'frameRate': {'ideal': 30, 'max': 30},
+        }
+      });
+      _localStream = localStream;
+      if (_rendererReady) {
+        _localRenderer.srcObject = localStream;
+      }
+
+      final pc = await createPeerConnection({
+        'iceServers': [
+          {'urls': 'stun:stun.l.google.com:19302'}
+        ],
+        'sdpSemantics': 'unified-plan',
+      });
+      _peer = pc;
+
+      for (final track in localStream.getVideoTracks()) {
+        await pc.addTrack(track, localStream);
+      }
+
+      pc.onConnectionState = (state) {
+        if (!mounted) return;
+        final raw = state.toString().toLowerCase();
+        setState(() {
+          _stateLabel = _friendlyConnectionLabel(state);
+          if (raw.contains('connected') && !raw.contains('disconnected')) {
+            _teleopConnected = true;
+          }
+          if (raw.contains('failed') ||
+              raw.contains('closed') ||
+              raw.contains('disconnected')) {
+            _teleopConnected = false;
+          }
+        });
+      };
+
+      final offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await _waitIceGatheringComplete(pc);
+      final localDesc = await pc.getLocalDescription();
+      if (localDesc == null) {
+        throw Exception('无法生成本地 SDP');
+      }
+
+      final resp = await http.post(
+        Uri.parse(offerUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'sdp': localDesc.sdp, 'type': localDesc.type}),
+      );
+      if (resp.statusCode != 200) {
+        throw Exception('信令失败: ${resp.statusCode} ${resp.body}');
+      }
+
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      await pc.setRemoteDescription(
+        RTCSessionDescription(data['sdp'] as String, data['type'] as String),
+      );
     } catch (e) {
+      await _teardown(silent: true);
       if (mounted) {
         setState(() {
-          _lastError = '无法连接服务器: $e';
+          _lastError = '启动 WebRTC 失败: $e';
+          _isConnecting = false;
+          _stateLabel = 'IDLE';
         });
       }
       return;
     }
 
-    final controller = CameraController(
-      front,
-      ResolutionPreset.low,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
-    );
-
-    try {
-      await controller.initialize();
-    } catch (e) {
-      await ch.sink.close();
-      if (mounted) {
-        setState(() {
-          _lastError = '摄像头初始化失败: $e';
-        });
-      }
-      return;
-    }
-
-    _streamTick = 0;
-    _framesSent = 0;
-    _channel = ch;
-    _camera = controller;
     setState(() {
       _streaming = true;
+      _isConnecting = false;
+      _stateLabel = 'LIVE';
+      _teleopConnected = true;
     });
-
-    unawaited(
-      controller.startImageStream((CameraImage frame) {
-        if (!_streaming || _camera != controller) return;
-        _streamTick++;
-        // 约 1/2 帧率，减轻 CPU 与带宽
-        if (_streamTick % 2 != 0) {
-          return;
-        }
-        final chLocal = _channel;
-        if (chLocal == null) return;
-        final jpeg = yuv420ToJpegColor(
-          frame,
-          quality: 60,
-          maxWidth: 480,
-        );
-        if (jpeg == null) return;
-        try {
-          chLocal.sink.add(jpeg);
-          _framesSent++;
-          if (mounted && (_framesSent % 10 == 0)) {
-            setState(() {});
-          }
-        } catch (e) {
-          if (mounted) {
-            setState(() {
-              _lastError = '发送失败: $e';
-            });
-            unawaited(_onStop());
-          }
-        }
-      }),
-    );
   }
 
   @override
@@ -230,7 +311,6 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const SizedBox(height: 8),
-                  const SizedBox(height: 8),
                   DecoratedBox(
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(16),
@@ -251,14 +331,14 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                       child: TextField(
                         controller: _urlController,
-                        enabled: !_streaming,
+                        enabled: !(_streaming || _isConnecting),
                         style: const TextStyle(
                           fontSize: 13,
                           fontFamily: 'monospace',
                           color: Color(0xFFE0E1DD),
                         ),
                         decoration: const InputDecoration(
-                          labelText: 'WebSocket 地址',
+                          labelText: 'WebRTC 信令地址(HTTP)',
                           labelStyle: TextStyle(color: Color(0xFF778DA9)),
                           border: InputBorder.none,
                         ),
@@ -272,7 +352,9 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                     children: [
                       Expanded(
                         child: FilledButton(
-                          onPressed: _streaming ? null : _onTeleop,
+                          onPressed: (_streaming || _isConnecting)
+                              ? null
+                              : _onTeleop,
                           style: FilledButton.styleFrom(
                             backgroundColor: const Color(0xFF2A9D8F),
                             foregroundColor: const Color(0xFF0D1B2A),
@@ -294,7 +376,9 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                       const SizedBox(width: 16),
                       Expanded(
                         child: FilledButton.tonal(
-                          onPressed: _streaming ? _onStop : null,
+                          onPressed: (_streaming || _isConnecting)
+                              ? _onStop
+                              : null,
                           style: FilledButton.styleFrom(
                             backgroundColor: const Color(0xFF415A77),
                             foregroundColor: const Color(0xFFE0E1DD),
@@ -319,13 +403,17 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                   Row(
                     children: [
                       _StatusChip(
-                        label: _streaming ? 'LIVE' : 'IDLE',
-                        active: _streaming,
+                        label: (_streaming || _isConnecting)
+                            ? _stateLabel
+                            : 'IDLE',
+                        active: _streaming || _isConnecting,
                         activeColor: const Color(0xFF2A9D8F),
                       ),
                       const Spacer(),
                       Text(
-                        '已发帧: $_framesSent',
+                        _isConnecting
+                            ? '正在建立teleop连接'
+                            : (_streaming ? 'WebRTC 推流中' : '等待推流'),
                         style: TextStyle(
                           color: colorScheme.onSurfaceVariant,
                           fontSize: 12,
@@ -349,11 +437,15 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                     borderRadius: BorderRadius.circular(16),
                     child: AspectRatio(
                       aspectRatio: 3 / 4,
-                      child: _streaming && _camera != null
+                      child: _streaming && _rendererReady && _localRenderer.srcObject != null
                           ? Stack(
                               fit: StackFit.expand,
                               children: [
-                                CameraPreview(_camera!),
+                                RTCVideoView(
+                                  _localRenderer,
+                                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                                  mirror: true,
+                                ),
                                 Positioned(
                                   left: 0,
                                   right: 0,
@@ -375,6 +467,46 @@ class _TeleopHomePageState extends State<TeleopHomePage> {
                                     ),
                                   ),
                                 ),
+                                if (_showRotateGuide)
+                                  Positioned.fill(
+                                    child: DecoratedBox(
+                                      decoration: const BoxDecoration(
+                                        color: Color(0x66000000),
+                                      ),
+                                      child: Center(
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            RotationTransition(
+                                              turns: Tween<double>(
+                                                begin: 0,
+                                                end: -1,
+                                              ).animate(_rotateHintController),
+                                              child: const Icon(
+                                                Icons.rotate_left_rounded,
+                                                size: 68,
+                                                color: Color(0xFF4CC9F0),
+                                              ),
+                                            ),
+                                            const SizedBox(height: 12),
+                                            Text(
+                                              _deviceOrientation ==
+                                                      NativeDeviceOrientation
+                                                          .portraitUp
+                                                  ? '请逆时针旋转手机90°至目标横屏位置'
+                                                  : '请继续旋转手机至目标横屏位置',
+                                              textAlign: TextAlign.center,
+                                              style: const TextStyle(
+                                                color: Color(0xFFE0E1DD),
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
                               ],
                             )
                           : ColoredBox(
